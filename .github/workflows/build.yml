@@ -95,8 +95,13 @@ jobs:
       - name: Copy .env
         run: cp .env.example .env
 
-      - name: Start stack
-        run: docker compose up -d --build
+      - name: Start ZooKeeper + Redis
+        run: docker compose up -d --build zookeeper1 zookeeper2 zookeeper3 redis
+
+      - name: Start 2 Solr nodes
+        run: |
+          docker compose --profile solr-node-1 up -d --build solr-node-1
+          docker compose --profile solr-node-2 up -d --build solr-node-2
 
       - name: Wait for Solr
         run: |
@@ -104,7 +109,7 @@ jobs:
             curl -sf http://localhost:8983/solr/admin/info/system && echo "Solr ready" && exit 0
             echo "Waiting for Solr… ($i/30)"; sleep 10
           done
-          docker compose logs solr1; exit 1
+          docker compose --profile solr-node-1 logs solr-node-1; exit 1
 
       - name: Wait for Redis
         run: |

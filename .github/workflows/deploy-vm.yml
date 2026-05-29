@@ -1,0 +1,114 @@
+name: Deploy to Cloud VM
+
+# Triggered manually from GitHub Actions UI or via API.
+# Works with any cloud: AWS EC2, GCP Compute Engine, Azure VM,
+# DigitalOcean Droplet, Hetzner, Linode — anything reachable by SSH.
+#
+# Required GitHub secrets:
+#   VM_SSH_PRIVATE_KEY   – private key whose public key is in authorized_keys on the VM
+#
+# Required GitHub variables (repo or environment level):
+#   VM_HOST              – public IP or hostname of the VM
+#   VM_USER              – SSH user (ubuntu / ec2-user / root …)
+#
+# Optional secrets:
+#   REDIS_PASSWORD       – written to .env on the VM before deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (must already be in registry)"
+        required: true
+        default: "latest"
+      solr_nodes:
+        description: "Solr node numbers to ensure are running (e.g. 1,2,3)"
+        required: true
+        default: "1,2"
+      action:
+        description: "What to do"
+        required: true
+        type: choice
+        options:
+          - full-deploy        # first time: install Docker, start ZK + nodes
+          - update-images      # rolling pull + restart of already-running nodes
+          - add-node           # start one more node (set solr_nodes to the new number only)
+          - remove-node        # stop one node (set solr_nodes to the node number only)
+      environment:
+        description: "GitHub environment (controls which secrets are used)"
+        required: true
+        type: choice
+        options: [production, staging]
+
+env:
+  REGISTRY:   ghcr.io
+  IMAGE_REPO: ${{ github.repository }}
+  IMAGE_TAG:  ${{ github.event.inputs.image_tag }}
+
+jobs:
+  deploy:
+    name: Deploy (${{ github.event.inputs.action }}) → ${{ vars.VM_HOST }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Write SSH key ─────────────────────────────────────────────────────
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ vars.VM_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      # ── Write .env so the VM gets credentials ────────────────────────────
+      - name: Write .env
+        run: |
+          cat > .env << EOF
+          IMAGE_REGISTRY=${{ env.REGISTRY }}
+          IMAGE_REPO=${{ env.IMAGE_REPO }}
+          IMAGE_TAG=${{ env.IMAGE_TAG }}
+          REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD || 'changeme' }}
+          SOLR_HEAP=2g
+          EOF
+
+      # ── Determine arguments for deploy script ─────────────────────────────
+      - name: Set deploy flags
+        id: flags
+        run: |
+          ACTION="${{ github.event.inputs.action }}"
+          case "$ACTION" in
+            full-deploy)   echo "flags=--install --nodes ${{ github.event.inputs.solr_nodes }}" >> $GITHUB_OUTPUT ;;
+            update-images) echo "flags=--update --tag ${{ env.IMAGE_TAG }}"                     >> $GITHUB_OUTPUT ;;
+            add-node)      echo "flags=--nodes ${{ github.event.inputs.solr_nodes }}"            >> $GITHUB_OUTPUT ;;
+            remove-node)   echo "flags=--remove-nodes ${{ github.event.inputs.solr_nodes }}"     >> $GITHUB_OUTPUT ;;
+          esac
+
+      # ── Run the universal VM deploy script ────────────────────────────────
+      - name: Deploy to VM
+        env:
+          VM_HOST: ${{ vars.VM_HOST }}
+          VM_USER: ${{ vars.VM_USER || 'ubuntu' }}
+        run: |
+          bash scripts/deploy-to-vm.sh "$VM_HOST" \
+            --user  "$VM_USER" \
+            --key   ~/.ssh/deploy_key \
+            --tag   "${{ env.IMAGE_TAG }}" \
+            ${{ steps.flags.outputs.flags }}
+
+      # ── Post-deploy cluster status ────────────────────────────────────────
+      - name: Cluster status
+        env:
+          VM_HOST: ${{ vars.VM_HOST }}
+          VM_USER: ${{ vars.VM_USER || 'ubuntu' }}
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              "$VM_USER@$VM_HOST" \
+              "cd /opt/solr-stack && make cluster-status" || true
+
+      - name: Clean up SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
