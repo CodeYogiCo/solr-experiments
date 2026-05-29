@@ -1,51 +1,96 @@
-.PHONY: help build up down logs plugin-build plugin-test data-load seed-redis \
-        k8s-apply k8s-delete clean
+.PHONY: help zk-up zk-down node-add node-remove node-restart \
+        cluster-status collection-create data-load seed-redis \
+        plugin-build plugin-test plugin-install \
+        build push k8s-apply k8s-delete clean
 
 REGISTRY   ?= ghcr.io/codeyogico/solr-experiments
 TAG        ?= latest
-COMPOSE    ?= docker compose
 SOLR_URL   ?= http://localhost:8983/solr
 REDIS_HOST ?= localhost
 REDIS_PORT ?= 6379
 
-help:
+# NODE must be set for node-* targets  (e.g. make node-add NODE=3)
+NODE ?=
+
+help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 	  awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-22s\033[0m %s\n", $$1, $$2}'
 
-# ── Local dev ──────────────────────────────────────────────────────────────────
-build: plugin-build ## Build all Docker images
-	$(COMPOSE) build
+# ── ZooKeeper (always-on backbone) ───────────────────────────────────────────
+zk-up: ## Start the 3-node ZooKeeper ensemble + Redis (no Solr)
+	docker compose up -d zookeeper1 zookeeper2 zookeeper3 redis
+	@echo "Waiting for ZooKeeper quorum..."
+	@until echo ruok | nc -w 2 localhost 2181 | grep -q imok; do sleep 2; done
+	@echo "ZooKeeper is ready."
 
-up: ## Start full stack locally
-	$(COMPOSE) up -d
-	@echo "Waiting for Solr to be ready..."
-	@until curl -sf $(SOLR_URL)/admin/info/system > /dev/null; do sleep 3; done
-	@echo "Solr is up: $(SOLR_URL)"
+zk-down: ## Stop ZooKeeper + Redis (also stops all Solr nodes)
+	docker compose down
 
-down: ## Stop all containers
-	$(COMPOSE) down -v
+# ── Solr node management ─────────────────────────────────────────────────────
+# Each Solr container is independent. ZooKeeper handles leader election.
+# You decide how many nodes run and when.
 
-logs: ## Tail all container logs
-	$(COMPOSE) logs -f
+node-add: ## Add a Solr node  →  make node-add NODE=3
+	@[ -n "$(NODE)" ] || { echo "Usage: make node-add NODE=<number>"; exit 1; }
+	@bash scripts/node-add.sh $(NODE)
 
-solr-logs: ## Tail Solr logs only
-	$(COMPOSE) logs -f solr1
+node-remove: ## Gracefully remove a Solr node  →  make node-remove NODE=3
+	@[ -n "$(NODE)" ] || { echo "Usage: make node-remove NODE=<number>"; exit 1; }
+	@bash scripts/node-remove.sh $(NODE)
+
+node-remove-purge: ## Remove node AND delete its data volume  →  make node-remove-purge NODE=3
+	@[ -n "$(NODE)" ] || { echo "Usage: make node-remove-purge NODE=<number>"; exit 1; }
+	@bash scripts/node-remove.sh $(NODE) --purge
+
+node-restart: ## Restart a single Solr node  →  make node-restart NODE=2
+	@[ -n "$(NODE)" ] || { echo "Usage: make node-restart NODE=<number>"; exit 1; }
+	docker compose --profile solr-node-$(NODE) restart solr-node-$(NODE)
+
+cluster-status: ## Show live nodes, shard leaders, ZK health
+	@bash scripts/cluster-status.sh $(SOLR_URL)
+
+node-logs: ## Tail logs for one node  →  make node-logs NODE=1
+	@[ -n "$(NODE)" ] || { echo "Usage: make node-logs NODE=<number>"; exit 1; }
+	docker compose --profile solr-node-$(NODE) logs -f solr-node-$(NODE)
+
+# ── Quick start (ZK + first 2 nodes) ─────────────────────────────────────────
+up: zk-up ## Start ZooKeeper + 2 Solr nodes (minimum viable cluster)
+	$(MAKE) node-add NODE=1
+	$(MAKE) node-add NODE=2
+	@echo ""
+	@echo "Cluster is up. Solr UI: http://localhost:8983/solr"
+	@echo ""
+	@echo "Next steps:"
+	@echo "  make collection-create   – create the bestbuy collection"
+	@echo "  make data-load           – index Best Buy product data"
+	@echo "  make seed-redis          – seed store availability bitmaps"
+	@echo "  make node-add NODE=3     – add a third Solr node"
+
+down: ## Stop everything
+	docker compose down
 
 # ── Plugin ────────────────────────────────────────────────────────────────────
-plugin-build: ## Compile and package the Solr Redis plugin
+plugin-build: ## Compile and package the Solr Redis plugin JAR
 	cd solr-redis-plugin && mvn package -DskipTests -q
 
 plugin-test: ## Run plugin unit tests
 	cd solr-redis-plugin && mvn test
 
-plugin-install: plugin-build ## Copy plugin JAR into the Solr image lib directory
+plugin-install: plugin-build ## Copy plugin JAR into docker/solr/lib/
+	mkdir -p docker/solr/lib
 	cp solr-redis-plugin/target/solr-redis-plugin-*.jar docker/solr/lib/
 
-# ── Data ──────────────────────────────────────────────────────────────────────
-collection-create: ## Create the bestbuy Solr collection
-	curl -sf "$(SOLR_URL)/admin/collections?action=CREATE&name=bestbuy&numShards=2&replicationFactor=2&maxShardsPerNode=2&collection.configName=bestbuy" | python3 -m json.tool
+# ── Collection management ────────────────────────────────────────────────────
+collection-create: ## Create the bestbuy Solr collection (2 shards, RF=2)
+	curl -sf "$(SOLR_URL)/admin/collections?action=CREATE\
+&name=bestbuy\
+&numShards=2\
+&replicationFactor=2\
+&maxShardsPerNode=2\
+&collection.configName=bestbuy" | python3 -m json.tool
 
-data-load: ## Load Best Buy product data into Solr
+# ── Data loading ─────────────────────────────────────────────────────────────
+data-load: ## Index Best Buy product data into Solr
 	cd data/scripts && pip install -r requirements.txt -q && \
 	python3 load-bestbuy-data.py --solr-url $(SOLR_URL) --collection bestbuy
 
@@ -53,29 +98,42 @@ seed-redis: ## Seed Redis bitmaps with synthetic store availability
 	cd data/scripts && python3 seed-redis-bitmaps.py \
 	  --redis-host $(REDIS_HOST) --redis-port $(REDIS_PORT)
 
-# ── Image publishing ───────────────────────────────────────────────────────────
+# ── Build ─────────────────────────────────────────────────────────────────────
+build: plugin-install ## Build all Docker images (plugin must be compiled first)
+	docker compose build
+
 push: ## Push images to registry
 	docker push $(REGISTRY)/solr:$(TAG)
 	docker push $(REGISTRY)/zookeeper:$(TAG)
 	docker push $(REGISTRY)/redis:$(TAG)
 
-# ── Kubernetes ────────────────────────────────────────────────────────────────
+# ── Kubernetes ───────────────────────────────────────────────────────────────
 k8s-apply: ## Apply all Kubernetes manifests
 	kubectl apply -f k8s/namespace.yaml
 	kubectl apply -f k8s/zookeeper/
 	kubectl apply -f k8s/redis/
-	@echo "Waiting for ZooKeeper..."
 	kubectl rollout status statefulset/zookeeper -n solr-stack --timeout=120s
 	kubectl apply -f k8s/solr/
 
 k8s-delete: ## Tear down Kubernetes stack
 	kubectl delete -f k8s/ --ignore-not-found
 
-k8s-status: ## Show pod status in solr-stack namespace
-	kubectl get pods -n solr-stack -o wide
+# ── Terraform EC2 bare metal ──────────────────────────────────────────────────
+ec2-plan: ## Plan EC2 bare-metal infrastructure changes
+	cd infra/terraform/aws-ec2 && terraform init && terraform plan
+
+ec2-apply: ## Provision EC2 bare-metal infrastructure
+	cd infra/terraform/aws-ec2 && terraform apply -auto-approve
+
+ec2-deploy: ## Rolling deploy to EC2 nodes  →  make ec2-deploy TAG=v1.2.3
+	cd infra/terraform/aws-ec2 && bash deploy.sh $(TAG)
+
+ec2-destroy: ## DESTROY all EC2 infrastructure (irreversible!)
+	@read -p "Destroy all EC2 resources? [yes/N] " ans && [ "$$ans" = "yes" ] || exit 1
+	cd infra/terraform/aws-ec2 && terraform destroy
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
-clean: ## Remove build artifacts and volumes
-	$(COMPOSE) down -v --remove-orphans
-	cd solr-redis-plugin && mvn clean -q
+clean: ## Remove containers, volumes, and build artifacts
+	docker compose down -v --remove-orphans
+	cd solr-redis-plugin && mvn clean -q 2>/dev/null || true
 	rm -f docker/solr/lib/solr-redis-plugin-*.jar
