@@ -25,7 +25,11 @@ x-solr: &solr
     dockerfile: docker/solr/Dockerfile
   networks: [solr-net]
   environment:
-    ZK_HOST: "zookeeper1:2181,zookeeper2:2181,zookeeper3:2181"
+    # Leave ZK_HOST unset so discover-zk.sh runs at container startup.
+    # In Docker Compose, Method 2 (DNS) resolves zookeeper1/2/3 automatically.
+    # Override with ZK_HOST=host:2181,... only if you need to force a specific address.
+    ZK_DISCOVERY_HOSTS: "zookeeper1 zookeeper2 zookeeper3"
+    CONSUL_HTTP_ADDR: "http://consul:8500"
     SOLR_HEAP: ${SOLR_HEAP:-2g}
     REDIS_HOST: redis
     REDIS_PORT: "6379"
@@ -107,6 +111,31 @@ services:
         server.2=zookeeper2:2888:3888
         server.3=zookeeper3:2888:3888
     volumes: [zk3-data:/data, zk3-log:/datalog]
+
+  # ── Consul (optional – profile "consul") ────────────────────────────────────
+  # Start with: docker compose --profile consul up -d consul
+  # When running, ZK nodes auto-register and Solr nodes discover ZK via Consul.
+  # Required for bare-metal / multi-VM deployments where Docker DNS is absent.
+  consul:
+    image: hashicorp/consul:1.18
+    profiles: ["consul"]
+    hostname: consul
+    networks: [solr-net]
+    command: >
+      consul agent -server -bootstrap-expect=1 -ui
+      -client=0.0.0.0
+      -bind=0.0.0.0
+      -datacenter=solr-dc
+    ports:
+      - "8500:8500"   # Consul UI + HTTP API
+      - "8600:8600/udp"  # Consul DNS
+    volumes: [consul-data:/consul/data]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "consul", "members"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
   # ── Redis ───────────────────────────────────────────────────────────────────
   redis:
@@ -217,3 +246,4 @@ volumes:
   solr-node-4-data:
   solr-node-5-data:
   solr-node-6-data:
+  consul-data:

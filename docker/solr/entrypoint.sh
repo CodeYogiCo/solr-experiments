@@ -1,39 +1,49 @@
 #!/bin/bash
+# Solr SolrCloud entrypoint.
+# Discovers ZooKeeper automatically, then starts Solr and uploads the configset.
 set -euo pipefail
 
-ZK_HOST="${ZK_HOST:-zookeeper1:2181,zookeeper2:2181,zookeeper3:2181}"
 SOLR_PORT="${SOLR_PORT:-8983}"
 SOLR_HEAP="${SOLR_HEAP:-2g}"
 NODE_NAME="${HOSTNAME}"
+ZK_DISCOVERY_RETRIES="${ZK_DISCOVERY_RETRIES:-20}"   # how many times to retry before giving up
+ZK_DISCOVERY_INTERVAL="${ZK_DISCOVERY_INTERVAL:-10}" # seconds between retries
 
-wait_for_zookeeper() {
-  local host port
-  IFS=',' read -ra NODES <<< "${ZK_HOST}"
-  for node in "${NODES[@]}"; do
-    host="${node%%:*}"
-    port="${node##*:}"
-    echo "Waiting for ZooKeeper at ${host}:${port}..."
-    until nc -z "${host}" "${port}"; do
-      sleep 2
-    done
-    echo "ZooKeeper ${host}:${port} is ready."
-    return 0
-  done
-}
+# ── Step 1: discover ZooKeeper ────────────────────────────────────────────────
+echo ">>> Discovering ZooKeeper ensemble..."
 
-upload_configset() {
-  local collection="bestbuy"
-  local configset_path="/opt/solr/server/solr/configsets/bestbuy/conf"
+ZK_HOST=""
+for attempt in $(seq 1 "$ZK_DISCOVERY_RETRIES"); do
+  ZK_HOST=$(bash /discover-zk.sh 2>/dev/null || true)
 
-  echo "Uploading configset '${collection}' to ZooKeeper..."
-  /opt/solr/bin/solr zk upconfig \
-    -n "${collection}" \
-    -d "${configset_path}" \
-    -z "${ZK_HOST}" || true
-}
+  if [ -n "$ZK_HOST" ]; then
+    echo ">>> ZooKeeper found on attempt ${attempt}: ${ZK_HOST}"
+    break
+  fi
 
-wait_for_zookeeper
-upload_configset
+  echo ">>> ZooKeeper not yet available (attempt ${attempt}/${ZK_DISCOVERY_RETRIES})," \
+       "retrying in ${ZK_DISCOVERY_INTERVAL}s..."
+  sleep "$ZK_DISCOVERY_INTERVAL"
+done
+
+if [ -z "$ZK_HOST" ]; then
+  echo "ERROR: Could not discover ZooKeeper after ${ZK_DISCOVERY_RETRIES} attempts."
+  echo "       See /discover-zk.sh for which discovery methods were tried."
+  exit 1
+fi
+
+export ZK_HOST
+
+# ── Step 2: upload configset (idempotent – safe to run on every node start) ───
+echo ">>> Uploading bestbuy configset to ZooKeeper..."
+/opt/solr/bin/solr zk upconfig \
+  -n bestbuy \
+  -d /opt/solr/server/solr/configsets/bestbuy/conf \
+  -z "${ZK_HOST}" 2>/dev/null || true
+# 'true' because another node racing here causes a harmless "already exists" error
+
+# ── Step 3: start Solr ────────────────────────────────────────────────────────
+echo ">>> Starting Solr node ${NODE_NAME} connected to ZK: ${ZK_HOST}"
 
 exec /opt/solr/bin/solr start \
   -f \
