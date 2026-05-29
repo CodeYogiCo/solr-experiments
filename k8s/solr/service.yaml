@@ -1,0 +1,42 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: solr-headless
+  namespace: solr-stack
+spec:
+  clusterIP: None
+  selector:
+    app: solr
+  ports:
+    - name: http
+      port: 8983
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: solr
+  namespace: solr-stack
+spec:
+  selector:
+    app: solr
+  ports:
+    - name: http
+      port: 8983
+      targetPort: 8983
+  type: ClusterIP
+---
+# LoadBalancer for external access (swap for Ingress in production)
+apiVersion: v1
+kind: Service
+metadata:
+  name: solr-external
+  namespace: solr-stack
+spec:
+  selector:
+    app: solr
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8983
+  type: LoadBalancer

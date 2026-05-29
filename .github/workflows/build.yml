@@ -1,0 +1,152 @@
+name: Build & Test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_REPO: ${{ github.repository }}
+
+jobs:
+  # ── 1. Build & test the Java plugin ─────────────────────────────────────────
+  plugin:
+    name: Solr Redis Plugin (Java)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+          cache: maven
+
+      - name: Build & test plugin
+        run: cd solr-redis-plugin && mvn verify -B
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: solr-redis-plugin
+          path: solr-redis-plugin/target/solr-redis-plugin-*.jar
+          if-no-files-found: error
+
+  # ── 2. Build Docker images ───────────────────────────────────────────────────
+  docker-build:
+    name: Docker Build (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    needs: plugin
+    strategy:
+      matrix:
+        include:
+          - image: solr
+            dockerfile: docker/solr/Dockerfile
+            context: .
+          - image: zookeeper
+            dockerfile: docker/zookeeper/Dockerfile
+            context: .
+          - image: redis
+            dockerfile: docker/redis/Dockerfile
+            context: docker/redis
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download plugin JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: solr-redis-plugin
+          path: docker/solr/lib/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push on PR)
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: false
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}/${{ matrix.image }}:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── 3. Integration test (docker compose) ────────────────────────────────────
+  integration:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: [plugin, docker-build]
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download plugin JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: solr-redis-plugin
+          path: docker/solr/lib/
+
+      - name: Copy .env
+        run: cp .env.example .env
+
+      - name: Start stack
+        run: docker compose up -d --build
+
+      - name: Wait for Solr
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8983/solr/admin/info/system && echo "Solr ready" && exit 0
+            echo "Waiting for Solr… ($i/30)"; sleep 10
+          done
+          docker compose logs solr1; exit 1
+
+      - name: Wait for Redis
+        run: |
+          for i in $(seq 1 15); do
+            docker compose exec redis redis-cli -a changeme ping | grep -q PONG && echo "Redis ready" && exit 0
+            sleep 5
+          done
+          exit 1
+
+      - name: Create Solr collection
+        run: |
+          curl -sf "http://localhost:8983/solr/admin/collections\
+            ?action=CREATE&name=bestbuy&numShards=2&replicationFactor=1\
+            &maxShardsPerNode=2&collection.configName=bestbuy"
+
+      - name: Load sample data (100 products)
+        run: |
+          pip install -r data/scripts/requirements.txt -q
+          python data/scripts/load-bestbuy-data.py \
+            --solr-url http://localhost:8983/solr \
+            --collection bestbuy \
+            --limit 100
+
+      - name: Seed Redis bitmaps
+        run: |
+          python data/scripts/seed-redis-bitmaps.py \
+            --redis-host localhost --redis-port 6379 \
+            --num-stores 5 --availability-rate 0.8
+
+      - name: Smoke test – basic query
+        run: |
+          HITS=$(curl -sf "http://localhost:8983/solr/bestbuy/select?q=*:*&rows=0" \
+                   | python3 -c "import sys,json; print(json.load(sys.stdin)['response']['numFound'])")
+          echo "Documents indexed: $HITS"
+          [ "$HITS" -gt 0 ] || { echo "No documents found"; exit 1; }
+
+      - name: Smoke test – store availability filter
+        run: |
+          curl -sf "http://localhost:8983/solr/bestbuy/select\
+            ?q=*:*&rows=5&store.id=1000&store.filterMode=annotate\
+            &fl=sku,name,storeAvailable" | python3 -m json.tool
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs

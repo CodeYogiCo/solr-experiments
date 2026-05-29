@@ -1,0 +1,51 @@
+# Build artifacts
+target/
+*.jar
+*.war
+*.class
+
+# Maven
+.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+*.egg
+
+# Environment
+.env
+.env.local
+!.env.example
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+
+# Docker volumes
+data/zookeeper/
+data/solr/
+data/redis/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Kubernetes secrets
+k8s/secrets/
+
+# Helm
+charts/

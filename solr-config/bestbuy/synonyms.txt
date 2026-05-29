@@ -1,0 +1,17 @@
+# Best Buy e-commerce synonyms
+tv,television
+laptop,notebook
+smartphone,mobile phone,cell phone
+headphones,earphones,earbuds
+smartwatch,smart watch
+gaming,game
+bluetooth,bt,wireless
+4k,uhd,ultra hd
+hd,high definition
+usb-c,usbc,usb c
+wifi,wi-fi,wireless
+ssd,solid state drive
+hdd,hard drive,hard disk drive
+ram,memory
+gpu,graphics card
+cpu,processor

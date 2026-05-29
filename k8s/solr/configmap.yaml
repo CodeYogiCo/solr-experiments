@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: solr-config
+  namespace: solr-stack
+data:
+  ZK_HOST: "zookeeper-0.zookeeper-headless.solr-stack.svc.cluster.local:2181,\
+            zookeeper-1.zookeeper-headless.solr-stack.svc.cluster.local:2181,\
+            zookeeper-2.zookeeper-headless.solr-stack.svc.cluster.local:2181"
+  SOLR_HEAP: "2g"
+  SOLR_PORT: "8983"
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"

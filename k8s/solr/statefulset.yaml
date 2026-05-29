@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: solr
+  namespace: solr-stack
+spec:
+  serviceName: solr-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: solr
+  updateStrategy:
+    type: RollingUpdate
+  podManagementPolicy: Parallel
+  template:
+    metadata:
+      labels:
+        app: solr
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: solr
+                topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsUser: 8983
+        fsGroup: 8983
+      containers:
+        - name: solr
+          image: ghcr.io/codeyogico/solr-experiments/solr:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8983
+          envFrom:
+            - configMapRef:
+                name: solr-config
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-secret
+                  key: password
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "3Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          readinessProbe:
+            httpGet:
+              path: /solr/admin/info/system
+              port: 8983
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 5
+          livenessProbe:
+            httpGet:
+              path: /solr/admin/ping
+              port: 8983
+            initialDelaySeconds: 90
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - name: solr-data
+              mountPath: /var/solr/data
+  volumeClaimTemplates:
+    - metadata:
+        name: solr-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 50Gi
