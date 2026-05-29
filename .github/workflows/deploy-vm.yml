@@ -1,41 +1,48 @@
-name: Deploy to Cloud VM
+name: Deploy to Cloud
 
-# Triggered manually from GitHub Actions UI or via API.
-# Works with any cloud: AWS EC2, GCP Compute Engine, Azure VM,
-# DigitalOcean Droplet, Hetzner, Linode — anything reachable by SSH.
+# One workflow for every cloud. Uses infra/provision.sh as the single entry point.
+# The same Docker images, same deploy-to-vm.sh, same Solr/ZK/Redis stack —
+# only the Terraform module changes per cloud.
 #
-# Required GitHub secrets:
-#   VM_SSH_PRIVATE_KEY   – private key whose public key is in authorized_keys on the VM
+# Required secrets (set per GitHub Environment):
+#   VM_SSH_PRIVATE_KEY   – SSH private key
+#   REDIS_PASSWORD       – Redis password
 #
-# Required GitHub variables (repo or environment level):
-#   VM_HOST              – public IP or hostname of the VM
-#   VM_USER              – SSH user (ubuntu / ec2-user / root …)
+# Cloud-specific secrets (only the cloud you use):
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  (aws)
+#   GCP_SA_KEY                                  (gcp – service account JSON)
+#   AZURE_CREDENTIALS                           (azure – az ad sp output JSON)
 #
-# Optional secrets:
-#   REDIS_PASSWORD       – written to .env on the VM before deploy
+# Variables (repo or environment level):
+#   ADMIN_CIDR   – your IP for SSH access (e.g. 1.2.3.4/32)
+#   SSH_PUBLIC_KEY – public key to inject into VMs
 
 on:
   workflow_dispatch:
     inputs:
-      image_tag:
-        description: "Image tag to deploy (must already be in registry)"
+      cloud:
+        description: "Target cloud"
         required: true
-        default: "latest"
-      solr_nodes:
-        description: "Solr node numbers to ensure are running (e.g. 1,2,3)"
-        required: true
-        default: "1,2"
+        type: choice
+        options: [aws, gcp, azure]
       action:
         description: "What to do"
         required: true
         type: choice
         options:
-          - full-deploy        # first time: install Docker, start ZK + nodes
-          - update-images      # rolling pull + restart of already-running nodes
-          - add-node           # start one more node (set solr_nodes to the new number only)
-          - remove-node        # stop one node (set solr_nodes to the node number only)
+          - apply          # provision infra + deploy (idempotent)
+          - deploy-only    # skip Terraform, just push new images to existing VMs
+          - plan           # show Terraform plan without applying
+          - destroy        # tear down all cloud resources
+      image_tag:
+        description: "Image tag to deploy"
+        required: true
+        default: "latest"
+      solr_nodes:
+        description: "Solr node numbers to start (e.g. 1,2 or 3 for add-node)"
+        default: "1,2"
       environment:
-        description: "GitHub environment (controls which secrets are used)"
+        description: "GitHub environment"
         required: true
         type: choice
         options: [production, staging]
@@ -47,68 +54,100 @@ env:
 
 jobs:
   deploy:
-    name: Deploy (${{ github.event.inputs.action }}) → ${{ vars.VM_HOST }}
+    name: "${{ github.event.inputs.action }} → ${{ github.event.inputs.cloud }}"
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.environment }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ── Write SSH key ─────────────────────────────────────────────────────
+      # ── Write SSH key ──────────────────────────────────────────────────────
       - name: Configure SSH
         run: |
-          mkdir -p ~/.ssh
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
           echo "${{ secrets.VM_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "${{ vars.VM_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      # ── Write .env so the VM gets credentials ────────────────────────────
-      - name: Write .env
+      # ── Cloud auth ────────────────────────────────────────────────────────
+      - name: Auth – AWS
+        if: github.event.inputs.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Auth – GCP
+        if: github.event.inputs.cloud == 'gcp'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Auth – Azure
+        if: github.event.inputs.cloud == 'azure'
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # ── Terraform ─────────────────────────────────────────────────────────
+      - name: Setup Terraform
+        if: github.event.inputs.action != 'deploy-only'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.7"
+
+      # ── Write tfvars ──────────────────────────────────────────────────────
+      - name: Write tfvars
+        if: github.event.inputs.action != 'deploy-only'
         run: |
-          cat > .env << EOF
-          IMAGE_REGISTRY=${{ env.REGISTRY }}
-          IMAGE_REPO=${{ env.IMAGE_REPO }}
-          IMAGE_TAG=${{ env.IMAGE_TAG }}
-          REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD || 'changeme' }}
-          SOLR_HEAP=2g
+          CLOUD="${{ github.event.inputs.cloud }}"
+          DIR="infra/terraform/${CLOUD}"
+          cat > "${DIR}/terraform.tfvars" << EOF
+          name             = "solr-stack"
+          ssh_public_key   = "${{ vars.SSH_PUBLIC_KEY }}"
+          admin_cidr       = "${{ vars.ADMIN_CIDR }}"
+          image_tag        = "${{ env.IMAGE_TAG }}"
+
+          # AWS specific
+          aws_region       = "${{ vars.AWS_REGION || 'us-east-1' }}"
+
+          # GCP specific
+          project_id       = "${{ vars.GCP_PROJECT_ID || '' }}"
+          region           = "${{ vars.GCP_REGION || 'us-central1' }}"
+
+          # Azure specific
+          location         = "${{ vars.AZURE_LOCATION || 'eastus' }}"
           EOF
 
-      # ── Determine arguments for deploy script ─────────────────────────────
-      - name: Set deploy flags
-        id: flags
+      # ── Run unified provision script ──────────────────────────────────────
+      - name: Provision + deploy
         run: |
-          ACTION="${{ github.event.inputs.action }}"
-          case "$ACTION" in
-            full-deploy)   echo "flags=--install --nodes ${{ github.event.inputs.solr_nodes }}" >> $GITHUB_OUTPUT ;;
-            update-images) echo "flags=--update --tag ${{ env.IMAGE_TAG }}"                     >> $GITHUB_OUTPUT ;;
-            add-node)      echo "flags=--nodes ${{ github.event.inputs.solr_nodes }}"            >> $GITHUB_OUTPUT ;;
-            remove-node)   echo "flags=--remove-nodes ${{ github.event.inputs.solr_nodes }}"     >> $GITHUB_OUTPUT ;;
-          esac
+          EXTRA=""
+          [ "${{ github.event.inputs.action }}" = "deploy-only" ] && EXTRA="--update"
 
-      # ── Run the universal VM deploy script ────────────────────────────────
-      - name: Deploy to VM
-        env:
-          VM_HOST: ${{ vars.VM_HOST }}
-          VM_USER: ${{ vars.VM_USER || 'ubuntu' }}
+          bash infra/provision.sh \
+            "${{ github.event.inputs.cloud }}" \
+            "${{ github.event.inputs.action }}" \
+            --tag      "${{ env.IMAGE_TAG }}" \
+            --nodes    "${{ github.event.inputs.solr_nodes }}" \
+            --ssh-key  ~/.ssh/deploy_key \
+            --install \
+            $EXTRA
+
+      # ── Summary ───────────────────────────────────────────────────────────
+      - name: Output summary
+        if: github.event.inputs.action != 'destroy' && github.event.inputs.action != 'plan'
+        working-directory: infra/terraform/${{ github.event.inputs.cloud }}
         run: |
-          bash scripts/deploy-to-vm.sh "$VM_HOST" \
-            --user  "$VM_USER" \
-            --key   ~/.ssh/deploy_key \
-            --tag   "${{ env.IMAGE_TAG }}" \
-            ${{ steps.flags.outputs.flags }}
+          echo "### Deployment complete" >> $GITHUB_STEP_SUMMARY
+          echo "| Output | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          terraform output -json 2>/dev/null | python3 -c "
+          import json, sys
+          for k, v in json.load(sys.stdin).items():
+              print(f'| {k} | \`{v[\"value\"]}\` |')
+          " >> $GITHUB_STEP_SUMMARY || true
 
-      # ── Post-deploy cluster status ────────────────────────────────────────
-      - name: Cluster status
-        env:
-          VM_HOST: ${{ vars.VM_HOST }}
-          VM_USER: ${{ vars.VM_USER || 'ubuntu' }}
-        run: |
-          ssh -i ~/.ssh/deploy_key \
-              -o StrictHostKeyChecking=no \
-              "$VM_USER@$VM_HOST" \
-              "cd /opt/solr-stack && make cluster-status" || true
-
-      - name: Clean up SSH key
+      - name: Clean up
         if: always()
-        run: rm -f ~/.ssh/deploy_key
+        run: rm -f ~/.ssh/deploy_key infra/terraform/*/terraform.tfvars

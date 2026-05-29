@@ -153,15 +153,30 @@ k8s-delete: ## Tear down Kubernetes stack
 ec2-plan: ## Plan EC2 bare-metal infrastructure changes
 	cd infra/terraform/aws-ec2 && terraform init && terraform plan
 
-ec2-apply: ## Provision EC2 bare-metal infrastructure
-	cd infra/terraform/aws-ec2 && terraform apply -auto-approve
+# ── Cloud deploy (unified – all clouds use the same interface) ───────────────
+# Usage: make cloud-apply CLOUD=gcp   or  make cloud-apply CLOUD=aws  etc.
 
-ec2-deploy: ## Rolling deploy to EC2 nodes  →  make ec2-deploy TAG=v1.2.3
-	cd infra/terraform/aws-ec2 && bash deploy.sh $(TAG)
+cloud-plan: ## Show Terraform plan  →  make cloud-plan CLOUD=gcp
+	@[ -n "$(CLOUD)" ] || { echo "Usage: make cloud-plan CLOUD=<aws|gcp|azure>"; exit 1; }
+	bash infra/provision.sh $(CLOUD) plan
 
-ec2-destroy: ## DESTROY all EC2 infrastructure (irreversible!)
-	@read -p "Destroy all EC2 resources? [yes/N] " ans && [ "$$ans" = "yes" ] || exit 1
-	cd infra/terraform/aws-ec2 && terraform destroy
+cloud-apply: ## Provision infra + deploy  →  make cloud-apply CLOUD=gcp TAG=v1.0
+	@[ -n "$(CLOUD)" ] || { echo "Usage: make cloud-apply CLOUD=<aws|gcp|azure>"; exit 1; }
+	bash infra/provision.sh $(CLOUD) apply --tag $(TAG) --nodes $(NODES) --install
+
+cloud-deploy: ## Deploy new images to existing VMs  →  make cloud-deploy CLOUD=aws TAG=v1.2
+	@[ -n "$(CLOUD)" ] || { echo "Usage: make cloud-deploy CLOUD=<aws|gcp|azure>"; exit 1; }
+	bash infra/provision.sh $(CLOUD) deploy-only --tag $(TAG) --update
+
+cloud-destroy: ## DESTROY cloud infrastructure (irreversible!)  →  make cloud-destroy CLOUD=gcp
+	@[ -n "$(CLOUD)" ] || { echo "Usage: make cloud-destroy CLOUD=<aws|gcp|azure>"; exit 1; }
+	bash infra/provision.sh $(CLOUD) destroy
+
+# Legacy AWS-specific aliases (kept for backwards compatibility)
+ec2-plan:    cloud-plan    CLOUD=aws
+ec2-apply:   cloud-apply   CLOUD=aws
+ec2-deploy:  cloud-deploy  CLOUD=aws
+ec2-destroy: cloud-destroy CLOUD=aws
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 clean: ## Remove containers, volumes, and build artifacts
