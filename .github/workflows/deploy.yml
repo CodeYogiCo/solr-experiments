@@ -7,7 +7,7 @@ on:
         description: "Target cloud provider"
         required: true
         type: choice
-        options: [aws, gcp, azure, kubernetes]
+        options: [aws-ec2-bare-metal, aws-ecs, gcp, azure, kubernetes]
       image_tag:
         description: "Image tag to deploy"
         required: true
@@ -24,11 +24,54 @@ env:
   IMAGE_TAG: ${{ github.event.inputs.image_tag }}
 
 jobs:
+  # ── AWS EC2 bare metal ───────────────────────────────────────────────────────
+  deploy-aws-ec2:
+    name: Deploy to AWS EC2 (bare metal, plain Docker Compose)
+    runs-on: ubuntu-latest
+    if: github.event.inputs.cloud == 'aws-ec2-bare-metal'
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.7"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Terraform init
+        working-directory: infra/terraform/aws-ec2
+        run: terraform init
+
+      - name: Terraform apply (provision / update infra)
+        working-directory: infra/terraform/aws-ec2
+        run: |
+          terraform apply -auto-approve \
+            -var="image_tag=${{ env.IMAGE_TAG }}" \
+            -var="admin_cidr=${{ vars.ADMIN_CIDR }}" \
+            -var="ssh_public_key=${{ secrets.EC2_SSH_PUBLIC_KEY }}"
+
+      - name: Rolling deploy to EC2 nodes
+        working-directory: infra/terraform/aws-ec2
+        env:
+          SSH_KEY_CONTENT: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+        run: |
+          echo "$SSH_KEY_CONTENT" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+          SSH_KEY=/tmp/deploy_key bash deploy.sh "${{ env.IMAGE_TAG }}"
+          rm -f /tmp/deploy_key
+
   # ── AWS ECS ──────────────────────────────────────────────────────────────────
   deploy-aws:
     name: Deploy to AWS ECS
     runs-on: ubuntu-latest
-    if: github.event.inputs.cloud == 'aws'
+    if: github.event.inputs.cloud == 'aws-ecs'
     environment: ${{ github.event.inputs.environment }}
     steps:
       - uses: actions/checkout@v4
