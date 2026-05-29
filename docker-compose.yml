@@ -1,5 +1,3 @@
-version: "3.9"
-
 # ════════════════════════════════════════════════════════════════════════════
 #  Manual-scale SolrCloud
 #
@@ -48,8 +46,7 @@ x-solr: &solr
 x-zk: &zk
   image: ${IMAGE_REGISTRY:-ghcr.io}/${IMAGE_REPO:-codeyogico/solr-experiments}/zookeeper:${IMAGE_TAG:-latest}
   build:
-    context: .
-    dockerfile: docker/zookeeper/Dockerfile
+    context: docker/zookeeper
   networks: [solr-net]
   environment:
     ZOO_4LW_COMMANDS_WHITELIST: "mntr,conf,ruok,srvr,stat"

@@ -1,5 +1,3 @@
-version: "3.9"
-
 # ════════════════════════════════════════════════════════════════════════════
 #  EXPERIMENTATION MODE  –  docker compose -f docker-compose.dev.yml up
 #
