@@ -3,18 +3,18 @@ version: "3.9"
 # ════════════════════════════════════════════════════════════════════════════
 #  Manual-scale SolrCloud
 #
-#  ZooKeeper ensemble  – always running, never touched after first boot
-#  Solr nodes          – each has its own profile; you start/stop them
-#                        one at a time with explicit make targets or compose
-#                        commands (see README / Makefile)
+#  ZooKeeper ensemble  – 3 nodes + HAProxy load balancer in front of them
+#  HAProxy             – single address (zookeeper-lb:2181) for all Solr nodes
+#  Solr nodes          – each has its own profile; connect to ZK via LB
 #
-#  ZooKeeper role: shard leader election, cluster-state bookkeeping,
-#                  config-set storage.  When a Solr leader goes down ZK
-#                  automatically promotes one of its live replicas.
+#  Solr nodes ONLY need to know: ZK_HOST=zookeeper-lb:2181
+#  HAProxy health-checks ZK nodes and routes only to live ones.
+#  ZooKeeper handles shard leader election internally.
 #
-#  Add a node:     make node-add    NODE=3
-#  Remove a node:  make node-remove NODE=3
-#  Cluster status: make cluster-status
+#  Add a Solr node:    make node-add    NODE=3
+#  Remove a Solr node: make node-remove NODE=3
+#  Cluster status:     make cluster-status
+#  HAProxy stats:      http://localhost:8404/stats
 # ════════════════════════════════════════════════════════════════════════════
 
 # ── Common Solr anchor ────────────────────────────────────────────────────────
@@ -25,18 +25,15 @@ x-solr: &solr
     dockerfile: docker/solr/Dockerfile
   networks: [solr-net]
   environment:
-    # Leave ZK_HOST unset so discover-zk.sh runs at container startup.
-    # In Docker Compose, Method 2 (DNS) resolves zookeeper1/2/3 automatically.
-    # Override with ZK_HOST=host:2181,... only if you need to force a specific address.
-    ZK_DISCOVERY_HOSTS: "zookeeper1 zookeeper2 zookeeper3"
-    CONSUL_HTTP_ADDR: "http://consul:8500"
+    # Single ZK address — the load balancer.
+    # HAProxy forwards to whichever ZK node is healthy.
+    # Override for cloud: ZK_HOST=your-cloud-lb.internal:2181
+    ZK_HOST: "zookeeper-lb:2181"
     SOLR_HEAP: ${SOLR_HEAP:-2g}
     REDIS_HOST: redis
     REDIS_PORT: "6379"
   depends_on:
-    zookeeper1: { condition: service_healthy }
-    zookeeper2: { condition: service_healthy }
-    zookeeper3: { condition: service_healthy }
+    zookeeper-lb: { condition: service_healthy }
   restart: unless-stopped
   ulimits:
     nofile: { soft: 65536, hard: 65536 }
@@ -86,7 +83,6 @@ services:
         server.2=zookeeper2:2888:3888
         server.3=zookeeper3:2888:3888
     volumes: [zk1-data:/data, zk1-log:/datalog]
-    ports: ["2181:2181"]
 
   zookeeper2:
     <<: *zk
@@ -111,6 +107,32 @@ services:
         server.2=zookeeper2:2888:3888
         server.3=zookeeper3:2888:3888
     volumes: [zk3-data:/data, zk3-log:/datalog]
+
+  # ── ZooKeeper load balancer (HAProxy L4 TCP) ─────────────────────────────────
+  # All Solr nodes connect to this single address: zookeeper-lb:2181
+  # HAProxy health-checks each ZK node with "ruok/imok" and only routes
+  # to nodes that are alive.  The peer ports (2888/3888) are NOT proxied —
+  # ZK nodes talk directly to each other on the Docker network.
+  zookeeper-lb:
+    image: haproxy:2.9-alpine
+    hostname: zookeeper-lb
+    networks: [solr-net]
+    depends_on:
+      zookeeper1: { condition: service_healthy }
+      zookeeper2: { condition: service_healthy }
+      zookeeper3: { condition: service_healthy }
+    volumes:
+      - ./docker/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "2181:2181"   # ZK client port (single entry point for all Solr nodes)
+      - "8404:8404"   # HAProxy stats UI
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   # ── Consul (optional – profile "consul") ────────────────────────────────────
   # Start with: docker compose --profile consul up -d consul

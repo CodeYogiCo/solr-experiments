@@ -10,7 +10,8 @@ REGISTRY="${registry}"
 IMAGE_REPO="${image_repo}"
 REDIS_HOST="${redis_host}"
 NODE_INDEX="${node_index}"
-ZK_HOSTS_SSM="${zk_hosts_ssm}"
+# NLB DNS name – single address for all Solr nodes, no IP lookup needed
+ZK_HOST="${zk_lb_dns}:2181"
 AWS_DEFAULT_REGION="$(curl -sf http://169.254.169.254/latest/meta-data/placement/region)"
 
 # ── Install Docker ────────────────────────────────────────────────────────────
@@ -38,32 +39,7 @@ mkdir -p /mnt/efs/zookeeper/${ZOO_MY_ID}/data \
 # Persist mount in fstab
 echo "${EFS_ID}:/ /mnt/efs efs _netdev,tls,iam 0 0" >> /etc/fstab
 
-# ── Wait for all 3 nodes to register their private IPs in SSM ─────────────────
-# (In practice: Terraform writes ZK hosts after all instances are up)
-ZK_HOSTS=""
-for i in $(seq 1 20); do
-  ZK_HOSTS=$(aws ssm get-parameter \
-    --name "${ZK_HOSTS_SSM}" \
-    --query Parameter.Value \
-    --output text 2>/dev/null || true)
-  [ -n "$ZK_HOSTS" ] && break
-  echo "Waiting for ZK hosts in SSM... ($i/20)"
-  sleep 15
-done
-
-if [ -z "$ZK_HOSTS" ]; then
-  echo "Warning: could not fetch ZK hosts from SSM; using localhost fallback"
-  ZK_HOSTS="localhost:2181"
-fi
-
-# ── Determine peer IPs for ZooKeeper config ───────────────────────────────────
-# Each host in the comma-separated list maps to server.N
-ZK_SERVER_LINES=""
-IFS=',' read -ra HOSTS <<< "$ZK_HOSTS"
-for i in "${!HOSTS[@]}"; do
-  HOST="${HOSTS[$i]%%:*}"
-  ZK_SERVER_LINES="${ZK_SERVER_LINES}server.$((i+1))=${HOST}:2888:3888\n"
-done
+# No IP polling needed – Solr connects to the NLB, not individual ZK nodes.
 
 # ── Write docker-compose.yml ──────────────────────────────────────────────────
 mkdir -p /opt/solr-stack
@@ -96,7 +72,7 @@ services:
     hostname: solr${ZOO_MY_ID}
     network_mode: host
     environment:
-      ZK_HOST: "${ZK_HOSTS}"
+      ZK_HOST: "${ZK_HOST}"
       SOLR_HEAP: "2g"
       REDIS_HOST: "${REDIS_HOST}"
     volumes:

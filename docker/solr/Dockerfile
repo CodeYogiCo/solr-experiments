@@ -2,14 +2,11 @@ FROM solr:9.6.0-slim AS base
 
 USER root
 
-# Install utilities needed for ZK discovery + health checks
+# Install utilities needed for ZK wait + health checks
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     netcat-openbsd \
-    dnsutils \
     jq \
-    python3 \
-    awscli \
   && rm -rf /var/lib/apt/lists/*
 
 # ── Security hardening ────────────────────────────────────────────────────────
@@ -30,10 +27,6 @@ COPY config/solr.xml /var/solr/data/solr.xml
 
 # ── Best Buy configset ────────────────────────────────────────────────────────
 COPY ../../solr-config/bestbuy/ /opt/solr/server/solr/configsets/bestbuy/conf/
-
-# ── ZooKeeper auto-discovery script ──────────────────────────────────────────
-COPY discover-zk.sh /discover-zk.sh
-RUN chmod +x /discover-zk.sh
 
 # ── Entry-point wrapper ───────────────────────────────────────────────────────
 COPY entrypoint.sh /entrypoint.sh

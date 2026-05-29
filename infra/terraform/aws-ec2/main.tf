@@ -340,15 +340,15 @@ resource "aws_instance" "solr_zk" {
   }
 
   user_data = base64encode(templatefile("${path.module}/user-data.sh", {
-    zoo_my_id     = count.index + 1
-    efs_id        = aws_efs_file_system.solr.id
-    image_tag     = var.image_tag
-    image_repo    = var.image_repo
-    registry      = var.registry
-    redis_host    = aws_instance.redis.private_ip
-    node_index    = count.index
-    # ZK peer IPs resolved after apply – injected via SSM parameter update in deploy step
-    zk_hosts_ssm  = "/${var.name}/zk-hosts"
+    zoo_my_id  = count.index + 1
+    efs_id     = aws_efs_file_system.solr.id
+    image_tag  = var.image_tag
+    image_repo = var.image_repo
+    registry   = var.registry
+    redis_host = aws_instance.redis.private_ip
+    node_index = count.index
+    # Solr uses the NLB DNS name – no individual ZK IPs needed
+    zk_lb_dns  = aws_lb.zookeeper.dns_name
   }))
 
   tags = {
@@ -382,17 +382,6 @@ resource "aws_instance" "redis" {
   }))
 
   tags = { Name = "${var.name}-redis", Role = "redis" }
-}
-
-# ── SSM: store ZK hosts for user-data bootstrap ─────────────────────────────────
-resource "aws_ssm_parameter" "zk_hosts" {
-  name  = "/${var.name}/zk-hosts"
-  type  = "String"
-  value = join(",", [
-    for i, inst in aws_instance.solr_zk :
-    "${inst.private_ip}:2181"
-  ])
-  overwrite = true
 }
 
 # ── ALB ──────────────────────────────────────────────────────────────────────────
