@@ -1,4 +1,5 @@
-.PHONY: help zk-up zk-down node-add node-remove node-restart \
+.PHONY: help dev dev-down dev-collection dev-load \
+        zk-up zk-down node-add node-remove node-restart \
         cluster-status collection-create data-load seed-redis \
         plugin-build plugin-test plugin-install \
         build push k8s-apply k8s-delete clean
@@ -15,6 +16,36 @@ NODE ?=
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 	  awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-22s\033[0m %s\n", $$1, $$2}'
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXPERIMENTATION MODE  –  single Solr node, ZooKeeper embedded inside Solr
+# ══════════════════════════════════════════════════════════════════════════════
+
+dev: ## Start experimentation stack (embedded ZK, 1 Solr node + Redis)
+	docker compose -f docker-compose.dev.yml up -d --build
+	@echo "Waiting for Solr..."
+	@until curl -sf http://localhost:8983/solr/admin/info/system > /dev/null 2>&1; do sleep 3; done
+	@echo ""
+	@echo "Solr UI:  http://localhost:8983/solr"
+	@echo ""
+	@echo "Next: make dev-collection  →  create bestbuy collection"
+	@echo "      make dev-load        →  index Best Buy products"
+
+dev-down: ## Stop experimentation stack
+	docker compose -f docker-compose.dev.yml down -v
+
+dev-collection: ## Create bestbuy collection (embedded ZK, 1 shard)
+	curl -sf "$(SOLR_URL)/admin/collections?action=CREATE\
+&name=bestbuy&numShards=1&replicationFactor=1\
+&collection.configName=bestbuy" | python3 -m json.tool
+
+dev-load: ## Load Best Buy data into experimentation stack
+	cd data/scripts && pip install -r requirements.txt -q && \
+	python3 load-bestbuy-data.py --solr-url $(SOLR_URL) --collection bestbuy --limit 5000
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRODUCTION MODE  –  separate ZK cluster (3 nodes) + Solr cluster + HAProxy LB
+# ══════════════════════════════════════════════════════════════════════════════
 
 # ── ZooKeeper (always-on backbone) ───────────────────────────────────────────
 zk-up: ## Start the 3-node ZooKeeper ensemble + Redis (no Solr)

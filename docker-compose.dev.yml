@@ -1,0 +1,75 @@
+version: "3.9"
+
+# ════════════════════════════════════════════════════════════════════════════
+#  EXPERIMENTATION MODE  –  docker compose -f docker-compose.dev.yml up
+#
+#  Single Solr container with ZooKeeper running INSIDE the Solr process.
+#  No separate ZooKeeper containers, no load balancer.
+#
+#  Use this for:  local dev, feature testing, schema iteration, CI smoke tests
+#  Do NOT use for: production, multi-node load testing, HA validation
+#
+#  Solr UI:  http://localhost:8983/solr
+#  Embedded ZK port: 9983 (internal only, no need to touch it)
+# ════════════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── Single Solr node with embedded ZooKeeper ─────────────────────────────────
+  solr:
+    image: ${IMAGE_REGISTRY:-ghcr.io}/${IMAGE_REPO:-codeyogico/solr-experiments}/solr:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: docker/solr/Dockerfile
+    hostname: solr-dev
+    environment:
+      SOLR_MODE: embedded        # ← tells entrypoint to use embedded ZK
+      SOLR_HEAP: ${SOLR_HEAP:-1g}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    ports:
+      - "8983:8983"   # Solr UI + API
+    volumes:
+      - solr-dev-data:/var/solr/data
+      # Mount local config so schema changes apply without rebuilding the image
+      - ./solr-config/bestbuy:/opt/solr/server/solr/configsets/bestbuy/conf:ro
+    networks: [dev-net]
+    depends_on:
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8983/solr/admin/info/system || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ── Redis (same image as production) ─────────────────────────────────────────
+  redis:
+    image: ${IMAGE_REGISTRY:-ghcr.io}/${IMAGE_REPO:-codeyogico/solr-experiments}/redis:${IMAGE_TAG:-latest}
+    build: { context: docker/redis }
+    hostname: redis
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
+    command: >
+      redis-server /usr/local/etc/redis/redis.conf
+      --requirepass ${REDIS_PASSWORD:-changeme}
+      --maxmemory 256mb
+    ports:
+      - "6379:6379"
+    volumes: [redis-dev-data:/data]
+    networks: [dev-net]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  dev-net:
+    driver: bridge
+
+volumes:
+  solr-dev-data:
+  redis-dev-data:
