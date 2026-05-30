@@ -15,9 +15,9 @@
     <lockType>${solr.lock.type:native}</lockType>
     <infoStream>false</infoStream>
     <mergePolicyFactory class="org.apache.solr.index.TieredMergePolicyFactory">
-      <int  name="maxMergeAtOnce">10</int>
-      <int  name="segmentsPerTier">10</int>
-      <bool name="deletesPctAllowed">true</bool>
+      <int    name="maxMergeAtOnce">10</int>
+      <int    name="segmentsPerTier">10</int>
+      <double name="deletesPctAllowed">33.0</double>
     </mergePolicyFactory>
   </indexConfig>
 
@@ -51,16 +51,35 @@
     <slowQueryThresholdMillis>1000</slowQueryThresholdMillis>
   </query>
 
-  <!-- ── Redis store availability component ──────────────────────────────── -->
-  <searchComponent name="storeAvailability"
-                   class="com.solrexperiments.redis.RedisStoreAvailabilityComponent">
+  <!-- ── Redis store availability ──────────────────────────────────────────
+       Two ways to use the Redis bitmap (key: store:{id}:availability):
+
+       1. Filter out-of-stock docs (correct numFound/paging/facets):
+            fq={!store_avail id=1234}
+       2. Annotate every doc with a storeAvailable boolean (no filtering):
+            fl=*,storeAvailable:[store_avail id=1234]
+
+       Both read the same redis.* connection config below; the singleton pool is
+       initialised by whichever plugin Solr loads first. -->
+  <queryParser name="store_avail"
+               class="com.solrexperiments.redis.StoreAvailabilityQParserPlugin">
     <str  name="redis.host">${redis.host:redis}</str>
     <int  name="redis.port">${redis.port:6379}</int>
     <str  name="redis.password">${redis.password:}</str>
     <int  name="redis.timeout">${redis.timeout:2000}</int>
     <int  name="redis.pool.maxTotal">${redis.pool.maxTotal:16}</int>
     <int  name="redis.pool.maxIdle">${redis.pool.maxIdle:8}</int>
-  </searchComponent>
+  </queryParser>
+
+  <transformer name="store_avail"
+               class="com.solrexperiments.redis.StoreAvailabilityTransformerFactory">
+    <str  name="redis.host">${redis.host:redis}</str>
+    <int  name="redis.port">${redis.port:6379}</int>
+    <str  name="redis.password">${redis.password:}</str>
+    <int  name="redis.timeout">${redis.timeout:2000}</int>
+    <int  name="redis.pool.maxTotal">${redis.pool.maxTotal:16}</int>
+    <int  name="redis.pool.maxIdle">${redis.pool.maxIdle:8}</int>
+  </transformer>
 
   <!-- ── Request handlers ─────────────────────────────────────────────────── -->
   <requestHandler name="/select" class="solr.SearchHandler">
@@ -75,9 +94,6 @@
                       customerReviewAverage,customerReviewCount,categoryLeaf,
                       thumbnailImage,url,onlineAvailability,inStoreAvailability</str>
     </lst>
-    <arr name="last-components">
-      <str>storeAvailability</str>
-    </arr>
   </requestHandler>
 
   <!-- Suggest handler for autocomplete -->
@@ -100,8 +116,8 @@
       <str name="field">suggest</str>
       <str name="weightField">customerReviewCount</str>
       <str name="suggestAnalyzerFieldType">text_suggest</str>
-      <bool name="buildOnStartup">false</bool>
-      <bool name="buildOnCommit">true</bool>
+      <str name="buildOnStartup">false</str>
+      <str name="buildOnCommit">true</str>
     </lst>
   </searchComponent>
 

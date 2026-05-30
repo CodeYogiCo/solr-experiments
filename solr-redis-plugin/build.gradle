@@ -1,0 +1,68 @@
+plugins {
+    id 'java'
+    // Fat-jar: bundles Jedis (+ commons-pool2) and relocates it so it can't
+    // clash with anything already on Solr's classpath.
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+group = 'com.solrexperiments'
+version = '1.0.0'
+
+ext {
+    solrVersion    = '9.6.0'
+    jedisVersion   = '5.1.3'
+    junitVersion   = '5.10.2'
+    mockitoVersion = '5.11.0'
+}
+
+repositories {
+    mavenCentral()
+}
+
+// Solr 9.6 runs on Java 17. Use --release so any JDK >= 17 (your local JDK 21,
+// the JDK 17 in the Docker builder) emits correct, portable Java 17 bytecode
+// without the "-source 17 bootstrap class path not set" warning.
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+}
+
+dependencies {
+    // Provided by the Solr container at runtime — compile against it, don't bundle.
+    compileOnly "org.apache.solr:solr-core:${solrVersion}"
+
+    // Redis client — bundled into the fat jar (relocated, see shadowJar below).
+    implementation "redis.clients:jedis:${jedisVersion}"
+
+    testImplementation "org.apache.solr:solr-core:${solrVersion}"
+    testImplementation "org.junit.jupiter:junit-jupiter:${junitVersion}"
+    testImplementation "org.mockito:mockito-core:${mockitoVersion}"
+    testImplementation "org.mockito:mockito-junit-jupiter:${mockitoVersion}"
+}
+
+test {
+    useJUnitPlatform()
+}
+
+shadowJar {
+    // Replace the default thin jar so only one artifact lands in build/libs,
+    // keeping the solrconfig.xml <lib> regex unambiguous.
+    archiveClassifier.set('')
+
+    // Avoid signature-file conflicts when merging dependency jars.
+    exclude 'META-INF/*.SF'
+    exclude 'META-INF/*.DSA'
+    exclude 'META-INF/*.RSA'
+
+    // Shade Jedis + its transitive pool lib under our namespace so a different
+    // Jedis on Solr's classpath can never shadow ours.
+    relocate 'redis.clients', 'com.solrexperiments.shaded.redis.clients'
+    relocate 'org.apache.commons.pool2', 'com.solrexperiments.shaded.commons.pool2'
+}
+
+// `gradle build` should yield the shaded jar as the primary artifact.
+jar {
+    enabled = false
+}
+tasks.named('assemble') {
+    dependsOn tasks.named('shadowJar')
+}

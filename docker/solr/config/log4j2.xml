@@ -6,6 +6,21 @@
         <Pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5p (%t) [%X{collection} %X{shard} %X{replica} %X{core}] %c{1.} %m%n</Pattern>
       </PatternLayout>
     </Console>
+
+    <!-- File appender so /var/solr/logs/solr.log exists. The entrypoint tails
+         this file to keep the container alive and to surface real Solr errors
+         (the console output is muted by bin/solr's -Dsolr.log.muteconsole). -->
+    <RollingFile name="RollingFile"
+                 fileName="${sys:solr.log.dir:-/var/solr/logs}/solr.log"
+                 filePattern="${sys:solr.log.dir:-/var/solr/logs}/solr.log.%i">
+      <PatternLayout>
+        <Pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5p (%t) [%X{collection} %X{shard} %X{replica} %X{core}] %c{1.} %m%n</Pattern>
+      </PatternLayout>
+      <Policies>
+        <SizeBasedTriggeringPolicy size="20 MB"/>
+      </Policies>
+      <DefaultRolloverStrategy max="9"/>
+    </RollingFile>
   </Appenders>
   <Loggers>
     <Logger name="org.apache.zookeeper" level="WARN"/>
@@ -15,6 +30,7 @@
     <Logger name="org.apache.solr.core.SolrCore" level="WARN"/>
     <Root level="${sys:solr.log.level:-INFO}">
       <AppenderRef ref="STDOUT"/>
+      <AppenderRef ref="RollingFile"/>
     </Root>
   </Loggers>
 </Configuration>

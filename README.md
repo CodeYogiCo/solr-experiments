@@ -1,221 +1,130 @@
-# Solr + ZooKeeper Production Stack
+# Solr + Redis local playground
 
-Production-grade SolrCloud with a Best Buy e-commerce dataset and a Redis
-bitmap plugin for real-time store availability filtering.
+A single-node **SolrCloud** (with ZooKeeper embedded in the Solr process) plus
+**Redis**, wired together with a custom Solr plugin that does real-time
+**store-availability filtering** from Redis bitmaps — over a Best Buy
+e-commerce dataset.
+
+Everything runs locally with one `docker compose` command. No external
+ZooKeeper, no cloud, no orchestrator.
+
+```
+┌──────────────────────────────────┐
+│  solr container                  │
+│  ├── Solr            :8983       │      ┌─────────────────────┐
+│  └── ZooKeeper (embedded, -DzkRun)│ ◄──► │  redis container    │
+│       :9983 (internal)           │      │  :6379  (bitmaps)   │
+└──────────────────────────────────┘      └─────────────────────┘
+```
 
 ---
 
-## Two deployment modes
-
-### Mode 1 — Experimentation (embedded ZooKeeper)
-
-One container. ZooKeeper runs inside the Solr process.
-Use this for local development, schema iteration, and feature testing.
-
-```
-┌──────────────────────────────┐
-│  solr-dev container          │
-│  ├── Solr  :8983             │
-│  └── ZooKeeper (embedded)    │   + Redis container
-│       :9983 (internal)       │
-└──────────────────────────────┘
-```
+## Quick start
 
 ```bash
-make dev               # start (builds images if needed)
-make dev-collection    # create the bestbuy collection
-make dev-load          # index ~5 000 Best Buy products
-make dev-down          # stop and remove volumes
+make up            # build images + start Solr + Redis, auto-creates 'bestbuy'
+make load-data     # index Best Buy products into Solr
+make seed-redis    # seed sample store-availability bitmaps in Redis
+make query         # run a sample availability filter + annotate query
 ```
 
-Solr UI → http://localhost:8983/solr
+- Solr UI → http://localhost:8983/solr
+- Redis   → `localhost:6379` (no password — local only)
 
----
-
-### Mode 2 — Production (separate ZooKeeper cluster)
-
-Three ZooKeeper nodes in their own cluster, behind an HAProxy TCP load
-balancer. Solr nodes connect to one address (`zookeeper-lb:2181`) and
-are added or removed manually. ZooKeeper handles shard leader election
-automatically.
-
-```
-  ┌─────────────────────────────────────────────────┐
-  │  ZooKeeper Ensemble (3 nodes)                   │
-  │  zookeeper1  zookeeper2  zookeeper3             │
-  └───────────────────┬─────────────────────────────┘
-                      │ health-checked by HAProxy
-              ┌───────▼────────┐
-              │ zookeeper-lb   │  :2181  (single address for Solr)
-              │ (HAProxy L4)   │  :8404  stats UI
-              └───────┬────────┘
-        ┌─────────────┼─────────────┐
-        ▼             ▼             ▼
-  solr-node-1   solr-node-2   solr-node-N
-  :8983         :8984         :898N
-```
+`make help` lists every target. Other handy ones:
 
 ```bash
-make up                 # start ZooKeeper + HAProxy + 2 Solr nodes
-make cluster-status     # show live nodes and shard leaders
-make node-add NODE=3    # add a third Solr node
-make node-remove NODE=2 # remove a node (ZK auto-elects new leader)
-make collection-create  # create bestbuy collection (2 shards, RF=2)
-make data-load          # index Best Buy products
-make seed-redis         # seed store availability bitmaps
-make down               # stop everything
+make logs          # tail Solr + Redis logs
+make restart       # restart the stack (keeps data volumes)
+make down          # stop the stack and remove volumes
+make clean         # down -v + clean the plugin build output
 ```
 
----
-
-## Components
-
-| Component | Image | Purpose |
-|---|---|---|
-| Solr | `docker/solr/` | Search engine, SolrCloud mode |
-| ZooKeeper | `docker/zookeeper/` | Leader election, cluster state, config storage |
-| HAProxy | `haproxy:2.9-alpine` | L4 TCP load balancer for ZK client port |
-| Redis | `docker/redis/` | Bitmap store availability data |
+> The plugin is compiled **inside** the Solr Docker image (multi-stage build),
+> so `make up` works with no local Java or Gradle installed.
 
 ---
 
-## Solr Redis plugin
+## The Redis store-availability plugin
 
-A custom Java `SearchComponent` (`solr-redis-plugin/`) that checks Redis
-bitmaps at query time to filter or annotate results by store availability.
+Two custom Solr extension points (`solr-redis-plugin/`, a Gradle project) that
+check a Redis bitmap at query time. Which extension point you want depends on
+what you're asking for:
 
-**How bitmaps work:**
+- **Filter** out-of-stock docs → a **PostFilter** (`{!store_avail}`, used as `fq`).
+  Filtering happens inside the collection chain, *before* the top-N collector,
+  so `rows`, `start`, `numFound`, and facet counts all reflect the filtered set.
+- **Annotate** every doc with availability → a **DocTransformer**
+  (`[store_avail]`, used in `fl`). Keeps all docs and leaves `numFound`/facets
+  untouched.
+
+**Local params** (both): `id` (required, the store ID) and `field` (optional,
+the numeric SKU field; default `sku`).
+
+**Filter — drop docs not in stock at store 1000:**
+```bash
+curl 'http://localhost:8983/solr/bestbuy/select?q=laptop&fq={!store_avail id=1000}&fl=sku,name'
+```
+
+**Annotate — keep all docs, add a `storeAvailable` boolean:**
+```bash
+curl 'http://localhost:8983/solr/bestbuy/select?q=laptop&fl=sku,name,storeAvailable:[store_avail id=1000]'
+```
+
+### How the bitmaps work
+
 - Key: `store:{storeId}:availability`
-- Bit offset: numeric product SKU
-- `SETBIT store:1234:availability 7823109 1` → product 7823109 is in stock at store 1234
-- `GETBIT store:1234:availability 7823109` → O(1) availability check
+- Bit offset: the numeric product **SKU** (read per-doc from the `sku` DocValues
+  field — not the stored field, which is unreliable inside a transformer)
+- `SETBIT store:1000:availability 7823109 1` → SKU 7823109 in stock at store 1000
+- `GETBIT store:1000:availability 7823109`   → O(1) availability check
 
-**Query parameters:**
+The Redis connection (`redis.host`/`redis.port`) is configured in
+`solr-config/bestbuy/solrconfig.xml` and supplied to the container via the
+`REDIS_HOST`/`REDIS_PORT` env vars in `docker-compose.yml`.
 
-| Parameter | Default | Description |
-|---|---|---|
-| `store.id` | (none) | Store ID to check. Omit to skip availability filtering. |
-| `store.productIdField` | `sku` | Solr field holding the numeric SKU |
-| `store.filterMode` | `filter` | `filter` removes unavailable docs; `annotate` adds `storeAvailable` field |
+### Building the plugin on its own
 
-**Example:**
-```
-GET /solr/bestbuy/select?q=laptop&store.id=1234&store.filterMode=filter&fl=sku,name
-```
+You don't need this for `make up` (the image builds it for you), but to iterate
+on the Java locally:
 
-Build and install the plugin:
 ```bash
-make plugin-build    # compiles, runs tests, creates fat JAR
-make plugin-install  # copies JAR to docker/solr/lib/
-make build           # rebuilds the Solr Docker image with the new JAR
+make plugin-build  # compile + package the shaded fat JAR
+make plugin-test   # run the unit tests
 ```
+
+The fat JAR relocates Jedis (and commons-pool2) under
+`com.solrexperiments.shaded.*` so it can't clash with anything on Solr's
+classpath.
 
 ---
 
 ## Best Buy data
 
 Product data from the [Best Buy open dataset](https://github.com/BestBuyAPIs/open-data-set)
-(~52 000 products). A Best Buy developer API key is optional for live data.
+(~52,000 products). No API key required.
 
 ```bash
-# Load from open dataset (no API key needed)
-make data-load
-
-# Load from live API
-BESTBUY_API_KEY=yourkey make data-load
-
-# Seed synthetic store availability in Redis
-make seed-redis   # generates 20 stores, ~70% availability rate
+make load-data                              # index the full open dataset
+# or run the loader directly for a smaller / custom load:
+cd data/scripts
+python3 load-bestbuy-data.py --limit 500    # index the first 500 products
+python3 load-bestbuy-data.py --file products.json
+BESTBUY_API_KEY=yourkey python3 load-bestbuy-data.py   # pull live data via the API
 ```
 
----
-
-## Cloud deployment
-
-### AWS EC2 bare metal (plain Docker Compose, no orchestrator)
+Seed synthetic per-store availability into Redis:
 
 ```bash
-cd infra/terraform/aws-ec2
-cp terraform.tfvars.example terraform.tfvars   # fill in your values
-terraform init && terraform apply              # provisions VMs, NLB, EFS
-
-# Roll out a new image version
-bash deploy.sh v1.2.3
+make seed-redis    # 5 stores (1000-1004), ~60% in-stock over a sample SKU range
+# or target specific SKUs/stores:
+cd data/scripts
+python3 seed-redis-bitmaps.py --stores 1000 1001 --sku-min 43000 --sku-max 200000
 ```
 
-Terraform creates:
-- 3 EC2 instances (Solr + ZooKeeper co-located, one per AZ)
-- 1 EC2 instance (Redis)
-- AWS Network Load Balancer in front of ZooKeeper (Solr uses NLB DNS, no IPs)
-- EFS filesystem for persistent data (survives instance replacement)
-- ALB for public Solr access
-
-### Kubernetes (any cloud — EKS, GKE, AKS, or self-hosted)
-
-```bash
-make k8s-apply    # creates namespace, ZK StatefulSet, Redis, Solr StatefulSet
-make k8s-status   # show pod status
-make k8s-delete   # tear down
-```
-
-### Any cloud VM (SSH deploy)
-
-```bash
-# First deploy (installs Docker, starts ZK + 2 Solr nodes)
-./scripts/deploy-to-vm.sh <VM_IP> --install --nodes 1,2
-
-# Add a node to a running cluster
-./scripts/deploy-to-vm.sh <VM_IP> --nodes 3
-
-# Rolling image update
-./scripts/deploy-to-vm.sh <VM_IP> --tag v1.2.3 --update
-```
-
-Works on: AWS EC2, GCP Compute Engine, Azure VM, DigitalOcean, Hetzner, Linode.
-
-### GitHub Actions (automated)
-
-Set in your repo **Settings → Secrets and Variables**:
-
-| Type | Name | Value |
-|---|---|---|
-| Secret | `VM_SSH_PRIVATE_KEY` | SSH private key |
-| Secret | `REDIS_PASSWORD` | Redis password |
-| Variable | `VM_HOST` | VM public IP |
-| Variable | `VM_USER` | `ubuntu` |
-
-Then: **Actions → Deploy to Cloud VM → Run workflow**
-
-Options: `full-deploy` / `update-images` / `add-node` / `remove-node`
-
----
-
-## ZooKeeper load balancer — why L4 only
-
-The HAProxy and AWS NLB configs use **TCP (L4)** load balancing, not HTTP (L7).
-ZooKeeper speaks a binary protocol; HTTP load balancers cannot handle it.
-
-The peer ports (2888/3888) used for ZK leader election are **never** behind
-the load balancer — ZK nodes communicate directly with each other on the
-Docker/VPC network. Only the client port (2181) is proxied.
-
----
-
-## Manual node scaling (production mode)
-
-Nodes are managed explicitly — no auto-scaling.
-
-```bash
-make node-add NODE=4        # start solr-node-4
-make node-remove NODE=2     # graceful remove (ZK elects new leaders)
-make node-remove-purge NODE=2  # remove + delete data volume
-make node-logs NODE=1       # tail logs for node 1
-make cluster-status         # live view of all nodes and shard leaders
-```
-
-When a node is removed, ZooKeeper detects the departure in < 5 seconds and
-promotes a replica to leader for any shards that lost theirs. No manual
-intervention required.
+> The `seed-redis` defaults cover a sample SKU range; to see the filter actually
+> drop documents, seed bits for SKUs that exist in your indexed data (e.g. take
+> a few `sku` values from `make query` output and `SETBIT` them).
 
 ---
 
@@ -225,26 +134,36 @@ intervention required.
 .
 ├── docker/
 │   ├── solr/
-│   │   ├── Dockerfile
-│   │   ├── entrypoint.sh       ← handles embedded + production modes
+│   │   ├── Dockerfile          ← multi-stage: builds the plugin, then the Solr image
+│   │   ├── entrypoint.sh       ← starts Solr with embedded ZK, auto-creates bestbuy
 │   │   └── config/             ← solr.xml, log4j2.xml
-│   ├── zookeeper/
-│   │   ├── Dockerfile
-│   │   └── entrypoint.sh       ← self-registers with Consul if present
-│   ├── redis/
-│   │   ├── Dockerfile
-│   │   └── redis.conf
-│   └── haproxy/
-│       └── haproxy.cfg         ← TCP LB for ZK client port
-├── solr-redis-plugin/          ← Java Maven project (Solr SearchComponent)
-├── solr-config/bestbuy/        ← schema.xml, solrconfig.xml, synonyms
-├── data/scripts/               ← Python: data loader + Redis bitmap seeder
-├── infra/
-│   ├── terraform/aws-ec2/      ← EC2 bare-metal Terraform
-│   └── swarm/                  ← Docker Swarm stack file
-├── k8s/                        ← Kubernetes manifests
-├── scripts/                    ← node-add, node-remove, cluster-status, deploy-to-vm
-├── docker-compose.yml          ← PRODUCTION mode
-├── docker-compose.dev.yml      ← EXPERIMENTATION mode (embedded ZK)
+│   └── redis/
+│       ├── Dockerfile
+│       └── redis.conf
+├── solr-redis-plugin/          ← Gradle project: PostFilter + DocTransformer
+│   └── src/main/java/com/solrexperiments/redis/
+│       ├── StoreAvailabilityQParserPlugin.java       ← the {!store_avail} PostFilter
+│       ├── StoreAvailabilityTransformerFactory.java  ← the [store_avail] DocTransformer
+│       └── RedisConnectionManager.java               ← shared Jedis pool
+├── solr-config/bestbuy/        ← schema.xml, solrconfig.xml, stopwords, synonyms
+├── data/scripts/               ← load-bestbuy-data.py, seed-redis-bitmaps.py
+├── docker-compose.yml
 └── Makefile
 ```
+
+CI (`.github/workflows/build.yml`) builds/tests the plugin, then stands up the
+whole stack and runs an end-to-end smoke test of both the filter and the
+transformer.
+
+---
+
+## Troubleshooting
+
+- **Solr container restart loops / 404 on every URL** — embedded ZooKeeper
+  couldn't write its data dir. `/var/solr/data` must be owned by the `solr`
+  user; a stale named volume from an older build can keep root ownership. Fix
+  with a clean restart: `make down && make up` (this recreates the volume).
+- **Real Solr logs** — inside the container at `/var/solr/logs/solr.log`
+  (the entrypoint tails this). `make logs` shows the container/entrypoint output.
+- **`make query` returns nothing for the filter** — you haven't seeded Redis
+  bits for SKUs that are actually indexed. See the data section above.

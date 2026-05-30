@@ -2,17 +2,9 @@ name: Build & Test
 
 on:
   push:
-    branches: ["**"]
+    branches: [main, "claude/**"]
   pull_request:
     branches: [main]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_REPO: ${{ github.repository }}
 
 jobs:
   # ── 1. Build & unit-test the Java plugin ────────────────────────────────────
@@ -26,200 +18,63 @@ jobs:
         with:
           java-version: "17"
           distribution: temurin
-          cache: maven
+          cache: gradle
 
       - name: Build & test plugin
-        run: cd solr-redis-plugin && mvn verify -B
+        run: cd solr-redis-plugin && ./gradlew --no-daemon build
 
-  # ── 2. Build Docker images ───────────────────────────────────────────────────
-  # Multi-stage Dockerfile compiles the plugin internally; no pre-built JAR needed.
-  docker-build:
-    name: Docker Build (${{ matrix.image }})
+  # ── 2. Build images + end-to-end smoke test ─────────────────────────────────
+  # The multi-stage Solr Dockerfile compiles the plugin internally, so this also
+  # exercises the Gradle build inside Docker.
+  smoke-test:
+    name: Smoke Test (local stack)
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - image: solr
-            dockerfile: docker/solr/Dockerfile
-            context: .
-          - image: zookeeper
-            dockerfile: docker/zookeeper/Dockerfile
-            context: docker/zookeeper
-          - image: redis
-            dockerfile: docker/redis/Dockerfile
-            context: docker/redis
+    needs: plugin
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Build and start the stack
+        run: docker compose up --build -d
 
-      - name: Build image
-        uses: docker/build-push-action@v5
-        with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile }}
-          push: false
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}/${{ matrix.image }}:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # ── 3. Dev stack smoke test (embedded ZK) ──────────────────────────────────
-  smoke-dev:
-    name: Dev Stack (embedded ZK)
-    runs-on: ubuntu-latest
-    needs: [plugin, docker-build]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Start dev stack (Solr + embedded ZK + Redis)
-        run: docker compose -f docker-compose.dev.yml up -d --build
-
-      - name: Wait for Solr
+      - name: Wait for Solr + bestbuy collection
         run: |
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:8983/solr/admin/info/system > /dev/null && echo "Solr ready" && exit 0
-            echo "Waiting for Solr... ($i/30)"; sleep 10
-          done
-          docker compose -f docker-compose.dev.yml logs
-          exit 1
-
-      - name: Wait for Redis
-        run: |
-          for i in $(seq 1 15); do
-            docker compose -f docker-compose.dev.yml exec redis \
-              redis-cli -a changeme ping 2>/dev/null | grep -q PONG && echo "Redis ready" && exit 0
+          for i in $(seq 1 40); do
+            if curl -sf "http://localhost:8983/solr/admin/collections?action=LIST" \
+                 | grep -q '"bestbuy"'; then
+              echo "collection ready"; exit 0
+            fi
             sleep 5
           done
-          exit 1
+          echo "Solr/collection did not become ready"; docker compose logs solr; exit 1
 
-      - name: Create bestbuy collection
+      - name: Seed Redis bitmap (sku 1000001 in stock at store 1000)
         run: |
-          curl -sf "http://localhost:8983/solr/admin/collections\
-            ?action=CREATE&name=bestbuy&numShards=1&replicationFactor=1\
-            &collection.configName=bestbuy" | python3 -m json.tool
+          docker compose exec -T redis redis-cli setbit store:1000:availability 1000001 1
+          docker compose exec -T redis redis-cli setbit store:1000:availability 1000002 0
 
-      - name: Load 100 sample products
+      - name: Index two products
         run: |
-          pip install -r data/scripts/requirements.txt -q
-          python3 data/scripts/load-bestbuy-data.py \
-            --solr-url http://localhost:8983/solr \
-            --collection bestbuy \
-            --limit 100
+          curl -sf -X POST "http://localhost:8983/solr/bestbuy/update?commit=true" \
+            -H 'Content-Type: application/json' \
+            -d '[{"id":"1","sku":1000001,"name":"in stock laptop"},
+                 {"id":"2","sku":1000002,"name":"out of stock laptop"}]'
 
-      - name: Verify documents indexed
+      - name: Assert PostFilter drops the out-of-stock doc
         run: |
-          HITS=$(curl -sf "http://localhost:8983/solr/bestbuy/select?q=*:*&rows=0" \
-                 | python3 -c "import sys,json; print(json.load(sys.stdin)['response']['numFound'])")
-          echo "Documents indexed: $HITS"
-          [ "$HITS" -gt 0 ] || { echo "No documents found"; exit 1; }
+          N=$(curl -sf "http://localhost:8983/solr/bestbuy/select?q=*:*&fq=%7B!store_avail%20id=1000%7D&rows=0" \
+                | python3 -c 'import sys,json; print(json.load(sys.stdin)["response"]["numFound"])')
+          echo "numFound with availability filter = $N (expected 1)"
+          [ "$N" = "1" ]
 
-      - name: Dump logs on failure
-        if: failure()
-        run: docker compose -f docker-compose.dev.yml logs
-
-  # ── 4. Production cluster smoke test (3-node ZK + HAProxy + 2 Solr nodes) ──
-  smoke-prod:
-    name: Production Cluster (external ZK)
-    runs-on: ubuntu-latest
-    needs: [plugin, docker-build]
-    if: github.event_name == 'push'
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Start ZooKeeper ensemble + HAProxy LB + Redis
+      - name: Assert DocTransformer annotates availability
         run: |
-          docker compose up -d --build zookeeper1 zookeeper2 zookeeper3
-          echo "Waiting for ZK ensemble..."
-          for i in $(seq 1 20); do
-            echo ruok | nc -w 2 localhost 2181 2>/dev/null | grep -q imok && echo "ZK ready" && break
-            echo "Waiting ZK... ($i/20)"; sleep 5
-          done
-          docker compose up -d zookeeper-lb redis
-
-      - name: Wait for ZK load balancer
-        run: |
-          for i in $(seq 1 20); do
-            echo ruok | nc -w 2 localhost 2181 2>/dev/null | grep -q imok && echo "ZK LB ready" && exit 0
-            echo "Waiting ZK LB... ($i/20)"; sleep 5
-          done
-          docker compose logs zookeeper-lb; exit 1
-
-      - name: Start 2 Solr nodes
-        run: |
-          docker compose --profile solr-node-1 up -d --build solr-node-1
-          docker compose --profile solr-node-2 up -d --build solr-node-2
-
-      - name: Wait for Solr node 1
-        run: |
-          for i in $(seq 1 36); do
-            curl -sf http://localhost:8983/solr/admin/info/system > /dev/null && echo "Solr-1 ready" && exit 0
-            echo "Waiting for Solr node 1... ($i/36)"; sleep 10
-          done
-          docker compose --profile solr-node-1 logs solr-node-1; exit 1
-
-      - name: Wait for Solr node 2
-        run: |
-          for i in $(seq 1 36); do
-            curl -sf http://localhost:8984/solr/admin/info/system > /dev/null && echo "Solr-2 ready" && exit 0
-            echo "Waiting for Solr node 2... ($i/36)"; sleep 10
-          done
-          docker compose --profile solr-node-2 logs solr-node-2; exit 1
-
-      - name: Wait for Redis
-        run: |
-          for i in $(seq 1 15); do
-            docker compose exec redis redis-cli -a changeme ping 2>/dev/null | grep -q PONG && echo "Redis ready" && exit 0
-            sleep 5
-          done
-          exit 1
-
-      - name: Create bestbuy collection (2 shards, RF=1 for 2-node CI)
-        run: |
-          curl -sf "http://localhost:8983/solr/admin/collections\
-            ?action=CREATE&name=bestbuy&numShards=2&replicationFactor=1\
-            &maxShardsPerNode=2&collection.configName=bestbuy" | python3 -m json.tool
-
-      - name: Verify cluster status
-        run: |
-          curl -sf "http://localhost:8983/solr/admin/collections?action=CLUSTERSTATUS" \
-            | python3 -c "
-          import sys, json
-          cs = json.load(sys.stdin)
-          nodes = cs['cluster']['live_nodes']
-          print(f'Live nodes: {len(nodes)}')
-          for n in nodes: print(f'  {n}')
-          assert len(nodes) >= 2, f'Expected 2+ live nodes, got {len(nodes)}'
-          print('Cluster OK')
-          "
-
-      - name: Load 100 sample products
-        run: |
-          pip install -r data/scripts/requirements.txt -q
-          python3 data/scripts/load-bestbuy-data.py \
-            --solr-url http://localhost:8983/solr \
-            --collection bestbuy \
-            --limit 100
-
-      - name: Seed Redis bitmaps
-        run: |
-          python3 data/scripts/seed-redis-bitmaps.py \
-            --redis-host localhost --redis-port 6379 \
-            --num-stores 5 --availability-rate 0.8
-
-      - name: Smoke test – basic query
-        run: |
-          HITS=$(curl -sf "http://localhost:8983/solr/bestbuy/select?q=*:*&rows=0" \
-                 | python3 -c "import sys,json; print(json.load(sys.stdin)['response']['numFound'])")
-          echo "Documents indexed: $HITS"
-          [ "$HITS" -gt 0 ] || { echo "No documents found"; exit 1; }
-
-      - name: Smoke test – store availability filter
-        run: |
-          curl -sf "http://localhost:8983/solr/bestbuy/select\
-            ?q=*:*&rows=5&store.id=1000&store.filterMode=annotate\
-            &fl=sku,name,storeAvailable" | python3 -m json.tool
+          curl -sf "http://localhost:8983/solr/bestbuy/select?q=*:*&fl=sku,storeAvailable:%5Bstore_avail%20id=1000%5D" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin)["response"]["docs"]; assert any(x.get("storeAvailable") is True for x in d) and any(x.get("storeAvailable") is False for x in d), d; print("annotate OK")'
 
       - name: Dump logs on failure
         if: failure()
         run: docker compose logs
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v

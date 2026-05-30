@@ -1,51 +1,40 @@
-# Build artifacts
-target/
-*.jar
-*.war
+# Dependencies
+node_modules/
+
+# Secrets / local env
+.env
+*.env
+!.env.example
+
+# Java
 *.class
 
-# Maven
-.mvn/wrapper/maven-wrapper.jar
-!**/src/main/**/target/
-!**/src/test/**/target/
+# Gradle (plugin JAR is baked into the Docker image at build time)
+solr-redis-plugin/build/
+solr-redis-plugin/.gradle/
+.gradle/
+plugin/*.jar
+solr-redis-plugin/lib/
+
+# Solr data
+solr_data/
+
+# Logs
+*.log
 
 # Python
 __pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-dist/
-build/
-*.egg
+*.pyc
 
-# Environment
-.env
-.env.local
-!.env.example
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
 
 # IDE
 .idea/
-*.iml
 .vscode/
+
+# OS / editor
 *.swp
-*.swo
-
-# Docker volumes
-data/zookeeper/
-data/solr/
-data/redis/
-
-# Logs
-logs/
-*.log
-
-# OS
 .DS_Store
-Thumbs.db
-
-# Kubernetes secrets
-k8s/secrets/
-
-# Helm
-charts/

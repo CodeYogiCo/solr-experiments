@@ -1,268 +1,74 @@
 # ════════════════════════════════════════════════════════════════════════════
-#  Manual-scale SolrCloud
+#  Local Solr playground
 #
-#  ZooKeeper ensemble  – 3 nodes + HAProxy load balancer in front of them
-#  HAProxy             – single address (zookeeper-lb:2181) for all Solr nodes
-#  Solr nodes          – each has its own profile; connect to ZK via LB
+#  Single Solr container with ZooKeeper running INSIDE the Solr process
+#  (embedded mode — no separate ZK containers), plus Redis for the
+#  store-availability bitmaps.
 #
-#  Solr nodes ONLY need to know: ZK_HOST=zookeeper-lb:2181
-#  HAProxy health-checks ZK nodes and routes only to live ones.
-#  ZooKeeper handles shard leader election internally.
+#  Quick start:
+#    docker compose up --build -d      # build + start solr + redis
+#    make collection                   # create the bestbuy collection
+#    make seed-redis                   # seed sample store-availability bitmaps
+#    make load-data                    # index sample Best Buy products
 #
-#  Add a Solr node:    make node-add    NODE=3
-#  Remove a Solr node: make node-remove NODE=3
-#  Cluster status:     make cluster-status
-#  HAProxy stats:      http://localhost:8404/stats
+#  Solr UI:  http://localhost:8983/solr
+#  Redis:    localhost:6379  (no password — local only)
 # ════════════════════════════════════════════════════════════════════════════
 
-# ── Common Solr anchor ────────────────────────────────────────────────────────
-x-solr: &solr
-  image: ${IMAGE_REGISTRY:-ghcr.io}/${IMAGE_REPO:-codeyogico/solr-experiments}/solr:${IMAGE_TAG:-latest}
-  build:
-    context: .
-    dockerfile: docker/solr/Dockerfile
-  networks: [solr-net]
-  environment:
-    # Single ZK address — the load balancer.
-    # HAProxy forwards to whichever ZK node is healthy.
-    # Override for cloud: ZK_HOST=your-cloud-lb.internal:2181
-    ZK_HOST: "zookeeper-lb:2181"
-    SOLR_HEAP: ${SOLR_HEAP:-2g}
-    REDIS_HOST: redis
-    REDIS_PORT: "6379"
-  depends_on:
-    zookeeper-lb: { condition: service_healthy }
-  restart: unless-stopped
-  ulimits:
-    nofile: { soft: 65536, hard: 65536 }
-  healthcheck:
-    test: ["CMD-SHELL", "curl -sf http://localhost:8983/solr/admin/info/system || exit 1"]
-    interval: 30s
-    timeout: 10s
-    retries: 5
-    start_period: 60s
-
-# ── Common ZooKeeper anchor ───────────────────────────────────────────────────
-x-zk: &zk
-  image: ${IMAGE_REGISTRY:-ghcr.io}/${IMAGE_REPO:-codeyogico/solr-experiments}/zookeeper:${IMAGE_TAG:-latest}
-  build:
-    context: docker/zookeeper
-  networks: [solr-net]
-  environment:
-    ZOO_4LW_COMMANDS_WHITELIST: "mntr,conf,ruok,srvr,stat"
-    ZOO_SERVERS: >-
-      server.1=zookeeper1:2888:3888
-      server.2=zookeeper2:2888:3888
-      server.3=zookeeper3:2888:3888
-  restart: unless-stopped
-  healthcheck:
-    test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep imok"]
-    interval: 15s
-    timeout: 5s
-    retries: 5
-    start_period: 20s
-
-# ══════════════════════════════════════════════════════════════════════════════
 services:
 
-  # ── ZooKeeper ensemble ──────────────────────────────────────────────────────
-  # These three always run. Never scale or remove them mid-cluster.
-  # A 3-node ensemble tolerates 1 node failure (quorum = 2).
-
-  zookeeper1:
-    <<: *zk
-    hostname: zookeeper1
+  # ── Single Solr node with embedded ZooKeeper ─────────────────────────────────
+  solr:
+    image: solr-experiments/solr:local
+    build:
+      context: .
+      dockerfile: docker/solr/Dockerfile
+    hostname: solr
     environment:
-      ZOO_MY_ID: 1
-      ZOO_4LW_COMMANDS_WHITELIST: "mntr,conf,ruok,srvr,stat"
-      ZOO_SERVERS: >-
-        server.1=zookeeper1:2888:3888
-        server.2=zookeeper2:2888:3888
-        server.3=zookeeper3:2888:3888
-    volumes: [zk1-data:/data, zk1-log:/datalog]
-
-  zookeeper2:
-    <<: *zk
-    hostname: zookeeper2
-    environment:
-      ZOO_MY_ID: 2
-      ZOO_4LW_COMMANDS_WHITELIST: "mntr,conf,ruok,srvr,stat"
-      ZOO_SERVERS: >-
-        server.1=zookeeper1:2888:3888
-        server.2=zookeeper2:2888:3888
-        server.3=zookeeper3:2888:3888
-    volumes: [zk2-data:/data, zk2-log:/datalog]
-
-  zookeeper3:
-    <<: *zk
-    hostname: zookeeper3
-    environment:
-      ZOO_MY_ID: 3
-      ZOO_4LW_COMMANDS_WHITELIST: "mntr,conf,ruok,srvr,stat"
-      ZOO_SERVERS: >-
-        server.1=zookeeper1:2888:3888
-        server.2=zookeeper2:2888:3888
-        server.3=zookeeper3:2888:3888
-    volumes: [zk3-data:/data, zk3-log:/datalog]
-
-  # ── ZooKeeper load balancer (HAProxy L4 TCP) ─────────────────────────────────
-  # All Solr nodes connect to this single address: zookeeper-lb:2181
-  # HAProxy health-checks each ZK node with "ruok/imok" and only routes
-  # to nodes that are alive.  The peer ports (2888/3888) are NOT proxied —
-  # ZK nodes talk directly to each other on the Docker network.
-  zookeeper-lb:
-    image: haproxy:2.9-alpine
-    hostname: zookeeper-lb
+      SOLR_MODE: embedded                 # ZooKeeper runs inside the Solr process
+      SOLR_HEAP: ${SOLR_HEAP:-1g}
+      REDIS_HOST: redis                   # passed to the plugin as -Dredis.host
+      REDIS_PORT: "6379"
+      AUTO_CREATE_COLLECTION: "true"      # create 'bestbuy' on first start
+    ports:
+      - "8983:8983"                       # Solr UI + API
+    volumes:
+      - solr-data:/var/solr/data
+      # Mount local config so schema/solrconfig edits apply on restart
+      # without rebuilding the image.
+      - ./solr-config/bestbuy:/opt/solr/server/solr/configsets/bestbuy/conf:ro
     networks: [solr-net]
     depends_on:
-      zookeeper1: { condition: service_healthy }
-      zookeeper2: { condition: service_healthy }
-      zookeeper3: { condition: service_healthy }
-    volumes:
-      - ./docker/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-    ports:
-      - "2181:2181"   # ZK client port (single entry point for all Solr nodes)
-      - "8404:8404"   # HAProxy stats UI
+      redis: { condition: service_healthy }
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8983/solr/admin/info/system || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ── Redis (store-availability bitmaps) ───────────────────────────────────────
+  redis:
+    image: solr-experiments/redis:local
+    build: { context: docker/redis }
+    hostname: redis
+    command: redis-server /usr/local/etc/redis/redis.conf --maxmemory 256mb
+    ports:
+      - "6379:6379"
+    volumes: [redis-data:/data]
+    networks: [solr-net]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 15s
 
-  # ── Consul (optional – profile "consul") ────────────────────────────────────
-  # Start with: docker compose --profile consul up -d consul
-  # When running, ZK nodes auto-register and Solr nodes discover ZK via Consul.
-  # Required for bare-metal / multi-VM deployments where Docker DNS is absent.
-  consul:
-    image: hashicorp/consul:1.18
-    profiles: ["consul"]
-    hostname: consul
-    networks: [solr-net]
-    command: >
-      consul agent -server -bootstrap-expect=1 -ui
-      -client=0.0.0.0
-      -bind=0.0.0.0
-      -datacenter=solr-dc
-    ports:
-      - "8500:8500"   # Consul UI + HTTP API
-      - "8600:8600/udp"  # Consul DNS
-    volumes: [consul-data:/consul/data]
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "consul", "members"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-
-  # ── Redis ───────────────────────────────────────────────────────────────────
-  redis:
-    image: ${IMAGE_REGISTRY:-ghcr.io}/${IMAGE_REPO:-codeyogico/solr-experiments}/redis:${IMAGE_TAG:-latest}
-    build: { context: docker/redis }
-    hostname: redis
-    networks: [solr-net]
-    command: >
-      redis-server /usr/local/etc/redis/redis.conf
-      --requirepass ${REDIS_PASSWORD:-changeme}
-    ports: ["6379:6379"]
-    volumes: [redis-data:/data]
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme}", "ping"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-
-  # ══════════════════════════════════════════════════════════════════════════
-  # SOLR NODES – each has its own profile.
-  #
-  # How ZooKeeper co-ordinates them:
-  #   • Every node registers in ZK under /live_nodes as it starts.
-  #   • When a collection is created, ZK assigns shard leaders and replicas
-  #     across the available nodes.
-  #   • If a leader's container stops, ZK detects the ephemeral node is gone
-  #     and elects the next best replica as the new leader (< 5 s).
-  #   • When you bring a node back, it re-joins /live_nodes and ZK
-  #     rebalances replicas if configured to do so.
-  #
-  # Starting nodes:
-  #   docker compose --profile solr-node-1 --profile solr-node-2 up -d
-  #
-  # Adding node 3 later:
-  #   docker compose --profile solr-node-3 up -d
-  #
-  # Removing node 3:
-  #   docker compose --profile solr-node-3 stop
-  #   docker compose --profile solr-node-3 rm -f
-  #
-  # Or use: make node-add NODE=3 / make node-remove NODE=3
-  # ══════════════════════════════════════════════════════════════════════════
-
-  solr-node-1:
-    <<: *solr
-    profiles: ["solr-node-1"]
-    hostname: solr-node-1
-    ports: ["8983:8983"]
-    volumes: [solr-node-1-data:/var/solr/data]
-
-  solr-node-2:
-    <<: *solr
-    profiles: ["solr-node-2"]
-    hostname: solr-node-2
-    ports: ["8984:8983"]
-    volumes: [solr-node-2-data:/var/solr/data]
-
-  solr-node-3:
-    <<: *solr
-    profiles: ["solr-node-3"]
-    hostname: solr-node-3
-    ports: ["8985:8983"]
-    volumes: [solr-node-3-data:/var/solr/data]
-
-  solr-node-4:
-    <<: *solr
-    profiles: ["solr-node-4"]
-    hostname: solr-node-4
-    ports: ["8986:8983"]
-    volumes: [solr-node-4-data:/var/solr/data]
-
-  solr-node-5:
-    <<: *solr
-    profiles: ["solr-node-5"]
-    hostname: solr-node-5
-    ports: ["8987:8983"]
-    volumes: [solr-node-5-data:/var/solr/data]
-
-  solr-node-6:
-    <<: *solr
-    profiles: ["solr-node-6"]
-    hostname: solr-node-6
-    ports: ["8988:8983"]
-    volumes: [solr-node-6-data:/var/solr/data]
-
-  # Need more than 6? Copy any block above, increment the number, and
-  # add a new port mapping (8989, 8990, …). Then run:
-  #   make node-add NODE=7
-
-# ── Networks ──────────────────────────────────────────────────────────────────
 networks:
   solr-net:
     driver: bridge
 
-# ── Volumes ───────────────────────────────────────────────────────────────────
 volumes:
-  zk1-data:
-  zk1-log:
-  zk2-data:
-  zk2-log:
-  zk3-data:
-  zk3-log:
+  solr-data:
   redis-data:
-  solr-node-1-data:
-  solr-node-2-data:
-  solr-node-3-data:
-  solr-node-4-data:
-  solr-node-5-data:
-  solr-node-6-data:
-  consul-data:
